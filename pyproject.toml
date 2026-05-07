@@ -1,13 +1,22 @@
 [project]
 name = "ppg-to-motion"
 version = "0.1.0"
-description = "Dataset builder for PPG motion datasets (IEEE DSP Cup and PPG-DaLiA)"
+description = "Dataset builder and preprocessing pipeline for PPG-DaLiA and VSM Pre-OP datasets"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.2",
     "scipy>=1.13",
     "tqdm>=4.66",
+    # torch: install the CUDA-appropriate wheel from https://pytorch.org/get-started/locally/
+    # e.g. pip install torch --index-url https://download.pytorch.org/whl/cu124
+    "torch>=2.1",
+    "datasets>=2.18",   # HuggingFace datasets — Arrow storage + memory-mapped splits
+    "openpyxl>=3.1",    # required by pandas read_excel (VSM master log)
+]
+
+[project.optional-dependencies]
+notebook = [
     "matplotlib>=3.8",
     "ipykernel>=6.29",
 ]
