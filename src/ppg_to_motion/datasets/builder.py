@@ -81,7 +81,19 @@ def _fix_len(arr: np.ndarray, n: int) -> np.ndarray:
     return np.pad(arr, (0, n - len(arr)), mode="edge")
 
 
-def _iter_samples(generators: list[tuple[str, Iterator[dict]]]) -> Iterator[dict]:
+def _iter_samples(
+    dalia_root: str | None,
+    vsm_root: str | None,
+    vsm_log: str | None,
+) -> Iterator[dict]:
+    generators: list[tuple[str, Iterator[dict]]] = []
+    if dalia_root:
+        generators.append(("ppg-dalia", ppg_dalia_generator(Path(dalia_root))))
+    if vsm_root:
+        generators.append(("vsm_preop", vsm_generator(
+            Path(vsm_root), Path(vsm_log) if vsm_log else None
+        )))
+
     seg_counters: dict[str, int] = {}
     for gen_label, gen in generators:
         n_gen = 0
@@ -136,7 +148,9 @@ def _iter_samples(generators: list[tuple[str, Iterator[dict]]]) -> Iterator[dict
 
 def build(
     output: Path,
-    generators: list[tuple[str, Iterator[dict]]],
+    dalia_root: Path | None = None,
+    vsm_root: Path | None = None,
+    vsm_log: Path | None = None,
     writer_batch_size: int = 1000,
 ) -> Dataset:
     """Build and save the HuggingFace dataset; return it."""
@@ -145,7 +159,11 @@ def build(
 
     ds = Dataset.from_generator(
         _iter_samples,
-        gen_kwargs={"generators": generators},
+        gen_kwargs={
+            "dalia_root": str(dalia_root) if dalia_root else None,
+            "vsm_root":   str(vsm_root)   if vsm_root   else None,
+            "vsm_log":    str(vsm_log)    if vsm_log    else None,
+        },
         features=FEATURES,
         writer_batch_size=writer_batch_size,
     )
@@ -181,18 +199,18 @@ def main():
         handlers=[logging.StreamHandler(), logging.FileHandler(log_path)],
     )
 
-    generators: list[tuple[str, Iterator[dict]]] = []
-    if args.dalia_root:
-        generators.append(("ppg-dalia", ppg_dalia_generator(args.dalia_root)))
-    if args.vsm_root:
-        generators.append(("vsm_preop", vsm_generator(args.vsm_root, args.vsm_log)))
-
-    if not generators:
+    if not args.dalia_root and not args.vsm_root:
         print("Error: specify at least one of --dalia-root or --vsm-root")
         raise SystemExit(1)
 
     args.output.mkdir(parents=True, exist_ok=True)
-    ds = build(args.output, generators, args.writer_batch_size)
+    ds = build(
+        args.output,
+        dalia_root=args.dalia_root,
+        vsm_root=args.vsm_root,
+        vsm_log=args.vsm_log,
+        writer_batch_size=args.writer_batch_size,
+    )
     print(f"\nDone. {len(ds)} segments → {args.output / 'dataset'}")
 
 
