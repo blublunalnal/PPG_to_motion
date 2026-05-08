@@ -8,11 +8,9 @@ dependencies = [
     "pandas>=2.2",
     "scipy>=1.13",
     "tqdm>=4.66",
-    # torch: install the CUDA-appropriate wheel from https://pytorch.org/get-started/locally/
-    # e.g. pip install torch --index-url https://download.pytorch.org/whl/cu124
     "torch>=2.1",
-    "datasets>=2.18",   # HuggingFace datasets — Arrow storage + memory-mapped splits
-    "openpyxl>=3.1",    # required by pandas read_excel (VSM master log)
+    "datasets>=2.18",   
+    "openpyxl>=3.1",    
 ]
 
 [project.optional-dependencies]
