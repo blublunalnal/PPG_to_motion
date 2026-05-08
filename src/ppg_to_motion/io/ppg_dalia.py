@@ -12,8 +12,8 @@ Each pickle contains a dict with:
 PPG (64 Hz) and ACC (32 Hz) are both upsampled to 100 Hz before windowing.
 ACC magnitude sqrt(X²+Y²+Z²) is computed after upsampling.
 
-Segmentation: 30-second windows (3000 samples at 100 Hz) with 75% overlap
-  → step = 750 samples (7.5 seconds).
+Segmentation: 30-second windows (3000 samples at 100 Hz) with 50% overlap
+  → step = 1500 samples (15 seconds).
 
 Signal images:
   diff_image — computed from the upsampled 100 Hz PPG window.
@@ -51,7 +51,7 @@ _ACTIVITY_NAMES: dict[int, str]  = {
     8 : "office_working"   
 }
 _WINDOW_SEC: int = 30
-_OVERLAP: float = 0.75
+_OVERLAP: float = 0.50
 # Raw-signal window (64 Hz) — used for STFT and HR label indexing only
 _WINDOW_SAMPLES: int = int(_PPG_FS * _WINDOW_SEC)        # 1920
 _STEP_SAMPLES: int = int(_WINDOW_SAMPLES * (1.0 - _OVERLAP))  # 480
@@ -134,7 +134,7 @@ def _mean_hr_for_window(labels: np.ndarray, start_sample: int) -> float | None:
 
 
 def ppg_dalia_generator(root: Path | str) -> Iterator[dict]:
-    """Yield 30-second PPG segments (75% overlap) from all 15 PPG-DaLiA subjects.
+    """Yield 30-second PPG segments (50% overlap) from all 15 PPG-DaLiA subjects.
 
     PPG and ACC are upsampled from their native rates (64 Hz and 32 Hz) to 100 Hz.
 

@@ -175,6 +175,7 @@ def _read_signals(csv_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
         logger.warning("Failed to read %s: %s", csv_path, exc)
         return None
     if df.empty:
+        logger.warning("Empty CSV (no rows): %s", csv_path)
         return None
     df.columns = df.columns.astype(str).str.strip()
 
@@ -289,15 +290,16 @@ def vsm_generator(
         meta = log_lookup.get(folder_id)
         if meta is None:
             if log_lookup:
-                logger.debug("Folder %s not in master log, skipping", folder_id)
+                logger.warning("Folder %s not in master log — skipping", folder_id)
                 continue
             meta = {"participant_id": folder_id, "rhythm_label": "", "usable": True}
         elif only_usable and not meta["usable"]:
+            logger.warning("Folder %s marked excluded in master log — skipping", folder_id)
             continue
 
         csv_path = _find_combined_csv(sub)
         if csv_path is None:
-            logger.debug("No combined CSV for %s", folder_id)
+            logger.warning("No Pre-OP CombinedData CSV found for %s — skipping", folder_id)
             continue
 
         result = _read_signals(csv_path)
@@ -318,6 +320,9 @@ def vsm_generator(
         source_file = str(csv_path.relative_to(root).as_posix())
         participant_id = meta["participant_id"]
         rhythm_label = meta["rhythm_label"]
+        mapped_label = VSM_preop_MAPPING.get(rhythm_label)
+        if mapped_label is None and rhythm_label:
+            logger.warning("%s: unmapped rhythm_label %r — stored as None", folder_id, rhythm_label)
 
         for start in range(0, n - _WINDOW_SAMPLES + 1, _STEP_SAMPLES):
             ppg_window = ppg[:, start : start + _WINDOW_SAMPLES]   # (6, WINDOW_SAMPLES)
@@ -328,7 +333,7 @@ def vsm_generator(
                 "acc": acc_window,
                 "sampling_rate": _PPG_FS,
                 "ID": participant_id,
-                "rhythm_label": VSM_preop_MAPPING.get(rhythm_label),
+                "rhythm_label": mapped_label,
                 "source": "vsm_preop",
                 "source_file": source_file,
             }

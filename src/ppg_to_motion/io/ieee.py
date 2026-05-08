@@ -49,6 +49,7 @@ def ieee_generator(root: Path | str) -> Iterator[dict]:
         split = "TRAIN" if "TRAIN" in ts_file.stem.upper() else "TEST"
         logger.info("Reading %s", ts_file)
         row_idx = 0
+        n_yielded = 0
 
         with ts_file.open("r", encoding="ascii") as fh:
             for raw_line in fh:
@@ -87,6 +88,10 @@ def ieee_generator(root: Path | str) -> Iterator[dict]:
                     "source": "ieee",
                     "source_file": str(ts_file),
                 }
+                n_yielded += 1
                 row_idx += 1
 
-        logger.info("IEEE %s: yielded %d segments", split, row_idx)
+        n_skipped = row_idx - n_yielded
+        if n_skipped:
+            logger.warning("IEEE %s: skipped %d / %d rows", split, n_skipped, row_idx)
+        logger.info("IEEE %s: yielded %d / %d rows", split, n_yielded, row_idx)
