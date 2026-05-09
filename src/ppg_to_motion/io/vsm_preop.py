@@ -22,6 +22,7 @@ from typing import Iterator
 
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, sosfiltfilt
 
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,12 @@ VSM_preop_MAPPING = {
     'svt (pre-atrial contractions)': 'SVTACH',
     'atrial fibrillation / typical atrial flutter': 'AF',
 }
+
+def _filter_acc(acc_3xN: np.ndarray, fs: float) -> np.ndarray:
+    """4th-order zero-phase Butterworth bandpass (0.5–30 Hz) applied per axis."""
+    sos = butter(4, [0.5, 30.0], btype="bandpass", fs=fs, output="sos")
+    return sosfiltfilt(sos, acc_3xN, axis=1).astype(np.float32)
+
 
 # ---------------------------------------------------------------------------
 # Master log
@@ -243,7 +250,10 @@ def _read_signals(csv_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
         repaired = _repair(acc_up[i], col, csv_path.name)
         acc_up[i] = repaired if repaired is not None else np.zeros(n_ppg, dtype=np.float32)
 
-    acc_mag = np.sqrt(np.sum(acc_up ** 2, axis=0)).astype(np.float32)  # (N,)
+    acc_up = _filter_acc(acc_up, _PPG_FS)
+    acc_mag = np.sqrt(np.sum(acc_up ** 2, axis=0))
+    _std = acc_mag.std()
+    acc_mag = ((acc_mag - acc_mag.mean()) / (_std if _std > 0 else 1.0)).astype(np.float32)
     return ppg, acc_mag  # ppg: (6, N), acc_mag: (N,)
 
 
@@ -268,10 +278,9 @@ def vsm_generator(
     sampling_rate : 100.0
     ID            : str — stable participant ID (MRN from master log, else folder name)
     rhythm_label  : str — from master log, empty string if unavailable
+    
     source        : "vsm_preop"
     source_file   : str — path to CombinedData CSV relative to root
-    diff_image    : np.ndarray (float32), shape (3, 3000)
-    stft_image    : np.ndarray (float32), shape (3, n_freqs, n_frames)
     """
     root = Path(root)
 
@@ -327,6 +336,7 @@ def vsm_generator(
         for start in range(0, n - _WINDOW_SAMPLES + 1, _STEP_SAMPLES):
             ppg_window = ppg[:, start : start + _WINDOW_SAMPLES]   # (6, WINDOW_SAMPLES)
             acc_window = acc_mag[start : start + _WINDOW_SAMPLES]
+            activity = "yes" if float(acc_window.max()) >= 2.5 else "no"
 
             yield {
                 "signal": ppg_window,
@@ -334,6 +344,7 @@ def vsm_generator(
                 "sampling_rate": _PPG_FS,
                 "ID": participant_id,
                 "rhythm_label": mapped_label,
+                "activity": activity,
                 "source": "vsm_preop",
                 "source_file": source_file,
             }

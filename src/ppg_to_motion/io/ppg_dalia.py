@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Iterator
 
 import numpy as np
-from scipy.signal import resample_poly
+from scipy.signal import butter, resample_poly, sosfiltfilt
 logger = logging.getLogger(__name__)
 
 _PPG_FS: float = 64.0   # native PPG rate (used for STFT and HR label alignment)
@@ -82,6 +82,12 @@ def _to_3xN_float32(arr: np.ndarray) -> np.ndarray:
     if a.ndim == 2 and a.shape[0] == 3:
         return a     # already (3,N)
     raise ValueError(f"Unexpected ACC shape: {a.shape}")
+
+
+def _filter_acc(acc_3xN: np.ndarray, fs: float) -> np.ndarray:
+    """4th-order zero-phase Butterworth bandpass (0.5–30 Hz) applied per axis."""
+    sos = butter(4, [0.5, 30.0], btype="bandpass", fs=fs, output="sos")
+    return sosfiltfilt(sos, acc_3xN, axis=1).astype(np.float32)
 
 
 def _upsample_ppg(ppg: np.ndarray) -> np.ndarray:
@@ -147,8 +153,6 @@ def ppg_dalia_generator(root: Path | str) -> Iterator[dict]:
     label         : float — mean HR in BPM for the window (omitted if unavailable)
     source        : "ppg-dalia"
     source_file   : str — path to the subject folder
-    diff_image    : np.ndarray (float32), shape (3, 3000) — from upsampled 100 Hz PPG
-    stft_image    : np.ndarray (float32), shape (3, n_freqs, n_frames) — from raw 64 Hz PPG
     """
     root = Path(root)
     data_dir = root / "data" / "PPG_FieldStudy"
@@ -175,7 +179,10 @@ def ppg_dalia_generator(root: Path | str) -> Iterator[dict]:
         ppg_up = _upsample_ppg(ppg)                               # (N_up,) at 100 Hz
         n_ppg_up = len(ppg_up)
         acc_up = _resample_acc(acc_raw, n_ppg_up)                 # (3, N_up) at 100 Hz
-        acc_mag = np.sqrt(np.sum(acc_up ** 2, axis=0))            # (N_up,)
+        acc_up = _filter_acc(acc_up, _OUT_FS)
+        acc_mag = np.sqrt(np.sum(acc_up ** 2, axis=0))
+        _std = acc_mag.std()
+        acc_mag = ((acc_mag - acc_mag.mean()) / (_std if _std > 0 else 1.0)).astype(np.float32)
         labels   = np.asarray(data.get("label",    []), dtype=np.float32)
         activity = np.asarray(data.get("activity", []), dtype=np.int32).squeeze()
 
