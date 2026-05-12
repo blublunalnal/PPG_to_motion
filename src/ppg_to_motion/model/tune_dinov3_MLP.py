@@ -41,6 +41,12 @@ try:
 except ImportError:
     PEFT_AVAILABLE = False
 
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
 # ── Fixed dataset constants (must match builder.py) ──────────────────────────
 ACC_LEN       = 3000                                      # 30 s × 100 Hz
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -214,6 +220,12 @@ class DinoAccelReconstructor(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+def log_cosh_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    # Numerically stable: log(cosh(x)) = x + softplus(-2x) - log(2)
+    diff = pred - target
+    return (diff + F.softplus(-2.0 * diff) - math.log(2.0)).mean()
+
+
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -264,8 +276,23 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> dict
 # ─────────────────────────────────────────────────────────────────────────────
 def train(args: argparse.Namespace) -> None:
     set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-    print(f"Device: {device}")
+
+    # ── Device ──────────────────────────────────────────────────────────────
+    if args.cpu:
+        device = torch.device("cpu")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    print(f"Device: {device}" + (f"  ({n_gpus} GPU{'s' if n_gpus != 1 else ''})" if n_gpus else ""))
+
+    # ── Workers ─────────────────────────────────────────────────────────────
+    num_workers = args.num_workers if args.num_workers >= 0 else min(os.cpu_count() or 1, 8)
+    print(f"DataLoader workers: {num_workers}")
 
     # ── Data ────────────────────────────────────────────────────────────────
     splits = Path(args.splits_dir)
@@ -275,15 +302,16 @@ def train(args: argparse.Namespace) -> None:
     val_ds   = AccelReconDataset(splits / "val")
     test_ds  = AccelReconDataset(splits / "test")
 
+    pin = device.type == "cuda"
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                               num_workers=args.num_workers, pin_memory=True)
+                               num_workers=num_workers, pin_memory=pin)
     val_loader   = DataLoader(val_ds,   batch_size=args.eval_batch_size, shuffle=False,
-                               num_workers=args.num_workers, pin_memory=True)
+                               num_workers=num_workers, pin_memory=pin)
     test_loader  = DataLoader(test_ds,  batch_size=args.eval_batch_size, shuffle=False,
-                               num_workers=args.num_workers, pin_memory=True)
+                               num_workers=num_workers, pin_memory=pin)
 
     # ── Model ───────────────────────────────────────────────────────────────
-    model = DinoAccelReconstructor(
+    model_core = DinoAccelReconstructor(
         model_id=args.model_name,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
@@ -297,20 +325,25 @@ def train(args: argparse.Namespace) -> None:
     # Verify reconstruction length matches ACC_LEN
     with torch.no_grad():
         dummy   = torch.zeros(1, 3, 65, 188, device=device)
-        out_len = model(dummy).size(1)
+        out_len = model_core(dummy).size(1)
     if out_len != ACC_LEN:
         print(
             f"WARNING: model output length {out_len} != ACC_LEN {ACC_LEN}. "
             f"Adjust --samples-per-patch so that T_patches × samples_per_patch = {ACC_LEN}."
         )
 
-    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_total     = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model_core.parameters() if p.requires_grad)
+    n_total     = sum(p.numel() for p in model_core.parameters())
     print(f"Trainable parameters: {n_trainable:,} / {n_total:,} ({100*n_trainable/n_total:.2f}%)")
 
+    # Wrap in DataParallel after counting params and building optimizer
+    model = nn.DataParallel(model_core) if n_gpus > 1 else model_core
+    if n_gpus > 1:
+        print(f"Wrapped in DataParallel across {n_gpus} GPUs")
+
     # ── Optimizer + scheduler ───────────────────────────────────────────────
-    optimizer = build_optimizer(model, args.lr_lora, args.lr_decoder, args.weight_decay)
-    criterion = nn.MSELoss()
+    optimizer = build_optimizer(model_core, args.lr_lora, args.lr_decoder, args.weight_decay)
+    criterion = log_cosh_loss
 
     total_steps  = max(1, (len(train_loader) // max(1, args.grad_accum)) * args.epochs)
     warmup_steps = int(args.warmup * total_steps)
@@ -322,11 +355,25 @@ def train(args: argparse.Namespace) -> None:
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=cosine_warmup)
-    scaler    = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available() and not args.no_amp)
+    use_amp   = device.type == "cuda" and not args.no_amp
+    scaler    = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     os.makedirs(args.out_dir, exist_ok=True)
     best_val_mse = float("inf")
+    best_epoch   = 0
     t0           = time.time()
+
+    # ── W&B ─────────────────────────────────────────────────────────────────
+    use_wandb = args.wandb and WANDB_AVAILABLE
+    if args.wandb and not WANDB_AVAILABLE:
+        print("WARNING: wandb not installed — run `pip install wandb`. Continuing without W&B.")
+    if use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity or None,
+            name=args.wandb_name or None,
+            config=vars(args),
+        )
 
     # ── Epoch loop ──────────────────────────────────────────────────────────
     for epoch in range(1, args.epochs + 1):
@@ -337,10 +384,10 @@ def train(args: argparse.Namespace) -> None:
         for step, (x, y) in enumerate(train_loader, 1):
             x, y = x.to(device), y.to(device)
 
-            with torch.amp.autocast("cuda", enabled=torch.cuda.is_available() and not args.no_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 pred = model(x)
                 L    = min(pred.size(1), y.size(1))
-                loss = criterion(pred[:, :L], y[:, :L]) / args.grad_accum
+                loss = criterion(pred[:, :L], y[:, :L]) / args.grad_accum  # log-cosh
 
             scaler.scale(loss).backward()
 
@@ -360,13 +407,23 @@ def train(args: argparse.Namespace) -> None:
             n_seen     += y.size(0)
 
             if step % args.log_every == 0:
+                step_loss = loss.item() * args.grad_accum
+                lr_lora   = optimizer.param_groups[0]["lr"]
+                lr_dec    = optimizer.param_groups[1]["lr"]
                 print(
                     f"Epoch {epoch:03d}/{args.epochs} | Step {step:05d} | "
-                    f"Loss {loss.item()*args.grad_accum:.6f} | "
-                    f"LR(lora) {optimizer.param_groups[0]['lr']:.2e} | "
+                    f"Loss {step_loss:.6f} | "
+                    f"LR(lora) {lr_lora:.2e} | "
                     f"T {human_time(time.time()-t0)}",
                     flush=True,
                 )
+                if use_wandb:
+                    global_step = (epoch - 1) * len(train_loader) + step
+                    wandb.log({
+                        "train/step_loss": step_loss,
+                        "train/lr_lora":   lr_lora,
+                        "train/lr_decoder": lr_dec,
+                    }, step=global_step)
 
         val_metrics = evaluate(model, val_loader, device)
         tr_loss     = total_loss / max(1, n_seen)
@@ -376,18 +433,42 @@ def train(args: argparse.Namespace) -> None:
             f"T={human_time(time.time()-t0)}"
         )
 
+        if use_wandb:
+            epoch_step = epoch * len(train_loader)
+            wandb.log({
+                "train/epoch_loss": tr_loss,
+                "val/MSE":          val_metrics["MSE"],
+                "val/MAE":          val_metrics["MAE"],
+                "epoch":            epoch,
+            }, step=epoch_step)
+
         if val_metrics["MSE"] < best_val_mse:
             best_val_mse = val_metrics["MSE"]
+            best_epoch   = epoch
             save_path    = os.path.join(args.out_dir, "best.pt")
-            torch.save({"model": model.state_dict(), "args": vars(args), "val": val_metrics},
-                        save_path)
+            torch.save({
+                "model": model_core.state_dict(),
+                "args":  vars(args),
+                "val":   val_metrics,
+                "epoch": epoch,
+            }, save_path)
             print(f"  -> Saved best (val_MSE={best_val_mse:.6f}) to {save_path}")
+            if use_wandb:
+                wandb.run.summary["best_val_MSE"]  = best_val_mse
+                wandb.run.summary["best_val_MAE"]  = val_metrics["MAE"]
+                wandb.run.summary["best_epoch"]    = best_epoch
 
     # ── Final test eval ─────────────────────────────────────────────────────
     ckpt = torch.load(os.path.join(args.out_dir, "best.pt"), map_location=device)
-    model.load_state_dict(ckpt["model"], strict=True)
+    model_core.load_state_dict(ckpt["model"], strict=True)
     test_metrics = evaluate(model, test_loader, device)
-    print(json.dumps({"best_val_MSE": best_val_mse, "test": test_metrics}, indent=2))
+    summary = {"best_val_MSE": best_val_mse, "best_epoch": best_epoch, "test": test_metrics}
+    print(json.dumps(summary, indent=2))
+
+    if use_wandb:
+        wandb.run.summary["test_MSE"] = test_metrics["MSE"]
+        wandb.run.summary["test_MAE"] = test_metrics["MAE"]
+        wandb.finish()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -433,12 +514,22 @@ def build_argparser() -> argparse.ArgumentParser:
                    help="Fraction of total steps used for linear warmup")
     p.add_argument("--grad-clip",        type=float, default=1.0)
     p.add_argument("--grad-accum",       type=int,   default=1)
-    p.add_argument("--num-workers",      type=int,   default=4)
+    p.add_argument("--num-workers",      type=int,   default=-1,
+                   help="DataLoader worker processes; -1 = auto (min(cpu_count, 8))")
     p.add_argument("--seed",             type=int,   default=42)
     p.add_argument("--cpu",              action="store_true")
     p.add_argument("--no-amp",           action="store_true")
     p.add_argument("--log-every",        type=int,   default=100)
     p.add_argument("--out-dir",          type=str,   default="./dinov3_accel_out")
+
+    # W&B
+    p.add_argument("--wandb",         action="store_true", help="Enable Weights & Biases logging")
+    p.add_argument("--wandb-project", type=str, default="ppg-to-motion",
+                   help="W&B project name")
+    p.add_argument("--wandb-entity",  type=str, default="",
+                   help="W&B entity (team or username); defaults to your W&B default")
+    p.add_argument("--wandb-name",    type=str, default="",
+                   help="W&B run name; auto-generated by W&B if omitted")
     return p
 
 

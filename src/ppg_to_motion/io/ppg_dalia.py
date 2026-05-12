@@ -85,8 +85,8 @@ def _to_3xN_float32(arr: np.ndarray) -> np.ndarray:
 
 
 def _filter_acc(acc_3xN: np.ndarray, fs: float) -> np.ndarray:
-    """4th-order zero-phase Butterworth bandpass (0.5–30 Hz) applied per axis."""
-    sos = butter(4, [0.5, 30.0], btype="bandpass", fs=fs, output="sos")
+    """4th-order zero-phase Butterworth bandpass (0.5–20 Hz) applied per axis."""
+    sos = butter(4, [0.5, 20.0], btype="bandpass", fs=fs, output="sos")
     return sosfiltfilt(sos, acc_3xN, axis=1).astype(np.float32)
 
 
