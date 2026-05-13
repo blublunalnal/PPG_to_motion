@@ -45,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from datasets import load_from_disk
+from datasets import DatasetDict, load_from_disk
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +104,8 @@ def make_splits(
     dataset_dir: Path,
     ratios: tuple[float, float, float] = (0.70, 0.10, 0.20),
     seed: int = 42,
+    hf_repo: str | None = None,
+    hf_private: bool = True,
 ) -> None:
     assert abs(sum(ratios) - 1.0) < 1e-6, "ratios must sum to 1"
     rng = np.random.default_rng(seed)
@@ -211,7 +213,15 @@ def make_splits(
     print(summary)
     (out_dir / "summary.txt").write_text(summary + "\n")
     print(f"\nSplits written to {out_dir}")
-    print("Load with: load_from_disk('output/splits/train').with_format('torch')")
+
+    if hf_repo:
+        print(f"\nPushing to HuggingFace Hub: {hf_repo} ...")
+        dataset_dict = DatasetDict({
+            name: load_from_disk(str(out_dir / name))
+            for name in ("train", "val", "test")
+        })
+        dataset_dict.push_to_hub(hf_repo, private=hf_private)
+        print(f"Done. Load on RunPod with: load_dataset('{hf_repo}')")
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +244,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--val-frac",   type=float, default=0.10, metavar="F")
     p.add_argument("--test-frac",  type=float, default=0.20, metavar="F")
     p.add_argument("--seed",       type=int,   default=42)
+    p.add_argument(
+        "--hf-repo", type=str, default=None, metavar="USER/REPO",
+        help="HuggingFace Hub repo to push splits to (e.g. myuser/ppg-to-motion). "
+             "Requires HF_TOKEN env var or prior `huggingface-cli login`."
+    )
+    p.add_argument(
+        "--hf-public", action="store_true",
+        help="Make the HF Hub repo public (default: private)."
+    )
     return p.parse_args()
 
 
@@ -244,4 +263,10 @@ if __name__ == "__main__":
         raise SystemExit(
             f"Fractions must sum to 1.0 (got {sum(ratios):.4f})"
         )
-    make_splits(args.dataset_dir, ratios=ratios, seed=args.seed)
+    make_splits(
+        args.dataset_dir,
+        ratios=ratios,
+        seed=args.seed,
+        hf_repo=args.hf_repo,
+        hf_private=not args.hf_public,
+    )
