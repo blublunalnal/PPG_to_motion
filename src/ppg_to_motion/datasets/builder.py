@@ -14,6 +14,7 @@ Stored arrays per segment
 -------------------------
   signal        float32 (3000,)        — raw PPG channel 0 at 100 Hz
   acc           float32 (3000,)        — ACC magnitude at 100 Hz
+  acc_xyz       float32 (3, 3000)      — bandpassed ACC [X, Y, Z] at 100 Hz
   ppg_channels  float32 (6, 3000)      — all 6 PPG channels (VSM only; None for DaLiA)
   diff_image    float32 (3, 3000)      — [x, dx, d²x] z-scored, built from channel 0
   stft_image    float32 (3, 65, 188)   — [z(log|X|), z(cos φ), z(sin φ)], built from channel 0
@@ -39,6 +40,7 @@ from datasets import Array2D, Array3D, Dataset, Features, Sequence, Value
 from tqdm import tqdm
 
 from ppg_to_motion.io.ppg_dalia import ppg_dalia_generator
+from ppg_to_motion.io.vsm_freeliving import vsm_freeliving_generator
 from ppg_to_motion.io.vsm_preop import vsm_generator
 from ppg_to_motion.preprocessing.signal_image_2d import (
     generate_differential_signal_image,
@@ -69,6 +71,7 @@ FEATURES = Features({
     "segment_index": Value("int32"),
     "signal":        Sequence(Value("float32"), length=_SIGNAL_LEN),
     "acc":           Sequence(Value("float32"), length=_SIGNAL_LEN),
+    "acc_xyz":       Array2D(shape=(3, _SIGNAL_LEN), dtype="float32"),
     "ppg_channels":  Array2D(shape=(_N_PPG_CHANNELS, _SIGNAL_LEN), dtype="float32"),  # VSM only — null for DaLiA
     "diff_image":    Array2D(shape=(3, _SIGNAL_LEN), dtype="float32"),
     "stft_image":    Array3D(shape=(3, _STFT_FREQS, _STFT_FRAMES), dtype="float32"),
@@ -81,10 +84,18 @@ def _fix_len(arr: np.ndarray, n: int) -> np.ndarray:
     return np.pad(arr, (0, n - len(arr)), mode="edge")
 
 
+def _fix_len_2d(arr: np.ndarray, n: int) -> np.ndarray:
+    """Trim or edge-pad a (C, T) array along the time axis to exactly n samples."""
+    if arr.shape[1] >= n:
+        return arr[:, :n]
+    return np.pad(arr, ((0, 0), (0, n - arr.shape[1])), mode="edge")
+
+
 def _iter_samples(
     dalia_root: str | None,
     vsm_root: str | None,
     vsm_log: str | None,
+    vsm_fl_root: str | None,
 ) -> Iterator[dict]:
     generators: list[tuple[str, Iterator[dict]]] = []
     if dalia_root:
@@ -93,12 +104,14 @@ def _iter_samples(
         generators.append(("vsm_preop", vsm_generator(
             Path(vsm_root), Path(vsm_log) if vsm_log else None
         )))
+    if vsm_fl_root:
+        generators.append(("vsm-free-living", vsm_freeliving_generator(Path(vsm_fl_root))))
 
     seg_counters: dict[str, int] = {}
     for gen_label, gen in generators:
         n_gen = 0
         for sample in tqdm(gen, desc=gen_label, unit="seg"):
-            subject_id = str(sample.get("ID", ""))
+            subject_id = str(sample.get("ID") or sample.get("subject_id", ""))
             seg_idx = seg_counters.get(subject_id, 0)
             seg_counters[subject_id] = seg_idx + 1
 
@@ -119,12 +132,24 @@ def _iter_samples(
                 _SIGNAL_LEN,
             )
 
-            diff_image = normalize_multichannel_image(
-                generate_differential_signal_image(ch0), method="zscore"
-            )
-            stft_image = generate_stft_features(
-                ch0, n_fft=_STFT_N_FFT, hop_length=_STFT_HOP
-            )
+            acc_xyz_raw = sample.get("acc_xyz")
+            if acc_xyz_raw is not None:
+                acc_xyz = _fix_len_2d(np.asarray(acc_xyz_raw, dtype=np.float32), _SIGNAL_LEN)
+            else:
+                acc_xyz = np.zeros((3, _SIGNAL_LEN), dtype=np.float32)
+
+            if sample.get("diff_image") is not None:
+                diff_image = np.asarray(sample["diff_image"], dtype=np.float32)
+            else:
+                diff_image = normalize_multichannel_image(
+                    generate_differential_signal_image(ch0), method="zscore"
+                )
+            if sample.get("stft_image") is not None:
+                stft_image = np.asarray(sample["stft_image"], dtype=np.float32)
+            else:
+                stft_image = generate_stft_features(
+                    ch0, n_fft=_STFT_N_FFT, hop_length=_STFT_HOP
+                )
 
             label_val = sample.get("label")
             n_gen += 1
@@ -139,6 +164,7 @@ def _iter_samples(
                 "segment_index": seg_idx,
                 "signal":        signal,
                 "acc":           acc,
+                "acc_xyz":       acc_xyz,
                 "ppg_channels":  ppg_channels,
                 "diff_image":    diff_image,
                 "stft_image":    stft_image,
@@ -151,6 +177,7 @@ def build(
     dalia_root: Path | None = None,
     vsm_root: Path | None = None,
     vsm_log: Path | None = None,
+    vsm_fl_root: Path | None = None,
     writer_batch_size: int = 1000,
 ) -> Dataset:
     """Build and save the HuggingFace dataset; return it."""
@@ -160,9 +187,10 @@ def build(
     ds = Dataset.from_generator(
         _iter_samples,
         gen_kwargs={
-            "dalia_root": str(dalia_root) if dalia_root else None,
-            "vsm_root":   str(vsm_root)   if vsm_root   else None,
-            "vsm_log":    str(vsm_log)    if vsm_log    else None,
+            "dalia_root":  str(dalia_root)  if dalia_root  else None,
+            "vsm_root":    str(vsm_root)    if vsm_root    else None,
+            "vsm_log":     str(vsm_log)     if vsm_log     else None,
+            "vsm_fl_root": str(vsm_fl_root) if vsm_fl_root else None,
         },
         features=FEATURES,
         writer_batch_size=writer_batch_size,
@@ -183,6 +211,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--vsm-root",   type=Path, metavar="DIR")
     p.add_argument("--vsm-log",    type=Path, metavar="FILE",
                    help="Optional Excel master log for VSM participant IDs and labels")
+    p.add_argument("--vsm-fl-root", type=Path, metavar="DIR",
+                   help="Directory containing VSM free-living parquet files (VSM*processed.parquet)")
     p.add_argument("--output",     type=Path, required=True, metavar="DIR")
     p.add_argument("--writer-batch-size", type=int, default=1000, metavar="N",
                    help="Rows buffered before each Arrow flush (default: 1000)")
@@ -199,8 +229,8 @@ def main():
         handlers=[logging.StreamHandler(), logging.FileHandler(log_path)],
     )
 
-    if not args.dalia_root and not args.vsm_root:
-        print("Error: specify at least one of --dalia-root or --vsm-root")
+    if not args.dalia_root and not args.vsm_root and not args.vsm_fl_root:
+        print("Error: specify at least one of --dalia-root, --vsm-root, or --vsm-fl-root")
         raise SystemExit(1)
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -209,6 +239,7 @@ def main():
         dalia_root=args.dalia_root,
         vsm_root=args.vsm_root,
         vsm_log=args.vsm_log,
+        vsm_fl_root=args.vsm_fl_root,
         writer_batch_size=args.writer_batch_size,
     )
     print(f"\nDone. {len(ds)} segments → {args.output / 'dataset'}")

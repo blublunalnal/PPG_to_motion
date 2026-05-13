@@ -168,13 +168,14 @@ def _repair(arr: np.ndarray, name: str, path: str) -> np.ndarray | None:
     return arr
 
 
-def _read_signals(csv_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
-    """Read all PPG channels and XYZ ACC from CSV; return (ppg (6, N), acc_mag (N,)) float32 or None.
+def _read_signals(csv_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Read all PPG channels and XYZ ACC from CSV.
 
+    Returns (ppg (6, N), acc_mag (N,), acc_xyz (3, N)) float32, or None on failure.
     PPG channel order matches _PPG_COLUMNS: S1, S2, S1.1, S2.1, S1.2, S2.2.
     Missing or unrepair-able channels are zero-filled; S1 (channel 0) missing → return None.
     ACC is upsampled to the PPG timestamp grid via linear interpolation.
-    acc_mag = sqrt(X² + Y² + Z²).
+    acc_mag = sqrt(X² + Y² + Z²), z-scored. acc_xyz is bandpassed per-axis values.
     """
     try:
         df = pd.read_csv(csv_path, skiprows=_CSV_SKIP_ROWS, header=0, low_memory=False)
@@ -217,7 +218,7 @@ def _read_signals(csv_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
     missing = [c for c in _ACC_COLUMNS if c not in df.columns]
     if missing:
         logger.warning("ACC columns %s missing in %s; storing zero ACC", missing, csv_path.name)
-        return ppg, np.zeros(n_ppg, dtype=np.float32)  # ppg: (6, N)
+        return ppg, np.zeros(n_ppg, dtype=np.float32), np.zeros((3, n_ppg), dtype=np.float32)
 
     if _ACC_TS_COLUMN in df.columns:
         acc_ts_raw = pd.to_numeric(df[_ACC_TS_COLUMN], errors="coerce").values
@@ -254,7 +255,7 @@ def _read_signals(csv_path: Path) -> tuple[np.ndarray, np.ndarray] | None:
     acc_mag = np.sqrt(np.sum(acc_up ** 2, axis=0))
     _std = acc_mag.std()
     acc_mag = ((acc_mag - acc_mag.mean()) / (_std if _std > 0 else 1.0)).astype(np.float32)
-    return ppg, acc_mag  # ppg: (6, N), acc_mag: (N,)
+    return ppg, acc_mag, acc_up  # ppg: (6, N), acc_mag: (N,), acc_up: (3, N)
 
 
 # ---------------------------------------------------------------------------
@@ -275,10 +276,10 @@ def vsm_generator(
     ------
     signal        : np.ndarray (float32), shape (6, 3000) — all PPG channels at 100 Hz (30 s); ch 0 = S1 green
     acc           : np.ndarray (float32), shape (3000,) — ACC magnitude sqrt(X²+Y²+Z²), upsampled to 100 Hz
+    acc_xyz       : np.ndarray (float32), shape (3, 3000) — bandpassed ACC [X, Y, Z] at 100 Hz
     sampling_rate : 100.0
     ID            : str — stable participant ID (MRN from master log, else folder name)
     rhythm_label  : str — from master log, empty string if unavailable
-    
     source        : "vsm_preop"
     source_file   : str — path to CombinedData CSV relative to root
     """
@@ -314,7 +315,7 @@ def vsm_generator(
         result = _read_signals(csv_path)
         if result is None:
             continue
-        ppg, acc_mag = result
+        ppg, acc_mag, acc_xyz_full = result
 
         n = ppg.shape[1]
         if n < _WINDOW_SAMPLES:
@@ -334,13 +335,15 @@ def vsm_generator(
             logger.warning("%s: unmapped rhythm_label %r — stored as None", folder_id, rhythm_label)
 
         for start in range(0, n - _WINDOW_SAMPLES + 1, _STEP_SAMPLES):
-            ppg_window = ppg[:, start : start + _WINDOW_SAMPLES]   # (6, WINDOW_SAMPLES)
-            acc_window = acc_mag[start : start + _WINDOW_SAMPLES]
+            ppg_window     = ppg[:, start : start + _WINDOW_SAMPLES]          # (6, 3000)
+            acc_window     = acc_mag[start : start + _WINDOW_SAMPLES]         # (3000,)
+            acc_xyz_window = acc_xyz_full[:, start : start + _WINDOW_SAMPLES] # (3, 3000)
             activity = "yes" if float(acc_window.max()) >= 2.5 else "no"
 
             yield {
-                "signal": ppg_window,
-                "acc": acc_window,
+                "signal":  ppg_window,
+                "acc":     acc_window,
+                "acc_xyz": acc_xyz_window,
                 "sampling_rate": _PPG_FS,
                 "ID": participant_id,
                 "rhythm_label": mapped_label,

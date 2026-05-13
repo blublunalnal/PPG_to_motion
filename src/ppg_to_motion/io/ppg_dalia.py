@@ -148,6 +148,7 @@ def ppg_dalia_generator(root: Path | str) -> Iterator[dict]:
     ------
     signal        : np.ndarray (float32), shape (3000,) — PPG upsampled to 100 Hz (30 s)
     acc           : np.ndarray (float32), shape (3000,) — ACC magnitude sqrt(X²+Y²+Z²) at 100 Hz
+    acc_xyz       : np.ndarray (float32), shape (3, 3000) — bandpassed ACC [X, Y, Z] at 100 Hz
     sampling_rate : 100.0
     ID            : str — subject ID from pickle, e.g. "S1"
     label         : float — mean HR in BPM for the window (omitted if unavailable)
@@ -197,14 +198,16 @@ def ppg_dalia_generator(root: Path | str) -> Iterator[dict]:
             if raw_start + _WINDOW_SAMPLES > n_ppg:
                 break
 
-            ppg_window_up = ppg_up[up_start : up_start + _OUT_WINDOW_SAMPLES]
-            acc_window    = acc_mag[up_start : up_start + _OUT_WINDOW_SAMPLES]
+            ppg_window_up  = ppg_up[up_start : up_start + _OUT_WINDOW_SAMPLES]
+            acc_window     = acc_mag[up_start : up_start + _OUT_WINDOW_SAMPLES]
+            acc_xyz_window = acc_up[:, up_start : up_start + _OUT_WINDOW_SAMPLES]
             hr  = _mean_hr_for_window(labels, raw_start) if len(labels) else None
             act = _mode_activity(activity, raw_start, _WINDOW_SAMPLES)
 
             result: dict = {
-                "signal": ppg_window_up,
-                "acc": acc_window,
+                "signal":  ppg_window_up,
+                "acc":     acc_window,
+                "acc_xyz": acc_xyz_window,
                 "sampling_rate": _OUT_FS,
                 "ID": subject_id,
                 "source": "ppg-dalia",

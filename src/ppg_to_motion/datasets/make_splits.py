@@ -4,10 +4,11 @@ Rules
 -----
 - Subject-level: every segment from a subject goes to exactly one split.
 - No subject appears in more than one split (verified at the end).
-- ppg-dalia  : subjects split randomly (no activity stratification — every
-               subject does every activity, so a random subject split already
-               keeps activity balance across splits).
-- vsm_preop  : subjects stratified by rhythm_label.
+- ppg-dalia      : subjects split randomly (no activity stratification — every
+                   subject does every activity, so a random subject split already
+                   keeps activity balance across splits).
+- vsm_preop      : subjects stratified by rhythm_label.
+- vsm-free-living: subjects split randomly (no label to stratify on).
 - Each source is split 70/10/20 independently, preserving the source ratio
   across all three splits.
 
@@ -113,9 +114,9 @@ def make_splits(
     ).to_pandas()
     df["_idx"] = np.arange(len(df))
 
-    df = df[df["source"].isin(["ppg-dalia", "vsm_preop"])]
+    df = df[df["source"].isin(["ppg-dalia", "vsm_preop", "vsm-free-living"])]
     if df.empty:
-        raise RuntimeError("No ppg-dalia or vsm_preop segments found in dataset")
+        raise RuntimeError("No ppg-dalia, vsm_preop, or vsm-free-living segments found in dataset")
 
     split_col = pd.Series("", index=df.index, dtype=str)
 
@@ -148,10 +149,21 @@ def make_splits(
         split_col[vsm[vsm["subject_id"].isin(va)].index] = "val"
         split_col[vsm[vsm["subject_id"].isin(te)].index] = "test"
 
+    # --- VSM Free-Living: no label to stratify on; random subject split ---
+    vsm_fl = df[df["source"] == "vsm-free-living"]
+    if not vsm_fl.empty:
+        fl_subjects = vsm_fl["subject_id"].unique()
+        fl_labels   = np.full(len(fl_subjects), "vsm-fl")
+        fl_counts   = vsm_fl.groupby("subject_id").size().reindex(fl_subjects).values
+        tr, va, te = _subject_split(fl_subjects, fl_labels, fl_counts, ratios, rng)
+        split_col[vsm_fl[vsm_fl["subject_id"].isin(tr)].index] = "train"
+        split_col[vsm_fl[vsm_fl["subject_id"].isin(va)].index] = "val"
+        split_col[vsm_fl[vsm_fl["subject_id"].isin(te)].index] = "test"
+
     df["split"] = split_col
 
     # Verify no subject leakage
-    for src in ["ppg-dalia", "vsm_preop"]:
+    for src in ["ppg-dalia", "vsm_preop", "vsm-free-living"]:
         src_df = df[df["source"] == src]
         sets = {
             name: set(src_df[src_df["split"] == name]["subject_id"])
@@ -176,15 +188,17 @@ def make_splits(
         split_df = df[df["split"] == name]
         n_dalia = (split_df["source"] == "ppg-dalia").sum()
         n_vsm   = (split_df["source"] == "vsm_preop").sum()
+        n_fl    = (split_df["source"] == "vsm-free-living").sum()
         total   = len(split_df)
         lines.append(
             f"{name:5s}: {total:6d} segments  "
             f"ppg-dalia={n_dalia} ({100*n_dalia/max(1,total):.1f}%)  "
-            f"vsm_preop={n_vsm} ({100*n_vsm/max(1,total):.1f}%)"
+            f"vsm_preop={n_vsm} ({100*n_vsm/max(1,total):.1f}%)  "
+            f"vsm-free-living={n_fl} ({100*n_fl/max(1,total):.1f}%)"
         )
 
     lines.append("")
-    for src in ["ppg-dalia", "vsm_preop"]:
+    for src in ["ppg-dalia", "vsm_preop", "vsm-free-living"]:
         src_df = df[df["source"] == src]
         if src_df.empty:
             continue
@@ -208,8 +222,8 @@ def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=textwrap.dedent("""\
             Subject-level 70/10/20 train/val/test split of the HF dataset.
-            ppg-dalia split randomly (activity balance follows naturally);
-            vsm_preop stratified by rhythm_label per subject.
+            ppg-dalia and vsm-free-living split randomly; vsm_preop stratified
+            by rhythm_label per subject. No subject appears in more than one split.
         """)
     )
     p.add_argument(
